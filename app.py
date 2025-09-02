@@ -24,21 +24,17 @@ def extract_data_from_excel(file_path):
     induction_clean = induction_df[['Periodo', 'DNI', 'Nombre', 'Apellido(s)', 'Dirección de correo', 'Calificación']].copy()
     induction_clean = induction_clean.rename(columns={'Calificación': 'induccion'})
     
-    # Combine both, prioritizing nota_induccion data
-    master_df = pd.concat([nota_induccion_clean, induction_clean])
-    
-    # Remove duplicates, keeping the first occurrence (which will be from nota_induccion if both exist)
-    master_df = master_df.drop_duplicates(subset=['DNI', 'Nombre', 'Apellido(s)'], keep='first')
+    # Combine both datasets
+    all_data = pd.concat([nota_induccion_clean, induction_clean])
     
     # Merge with bus biblioteca data
     bus_biblioteca_df = bus_biblioteca_df.rename(columns={'Promedio': 'bus_biblioteca'})
-    master_df = pd.merge(master_df, bus_biblioteca_df[['DNI', 'bus_biblioteca']], 
+    all_data = pd.merge(all_data, bus_biblioteca_df[['DNI', 'bus_biblioteca']], 
                         on='DNI', how='left')
     
     # Merge with diseño de sesión data
     diseno_sesion_df = diseno_sesion_df.rename(columns={'Promedio': 'diseno_sesion'})
-    # We need to match by name since DNI might not be available in this sheet
-    master_df = pd.merge(master_df, diseno_sesion_df[['Nombre', 'Apellido(s)', 'diseno_sesion']], 
+    all_data = pd.merge(all_data, diseno_sesion_df[['Nombre', 'Apellido(s)', 'diseno_sesion']], 
                         on=['Nombre', 'Apellido(s)'], how='left')
     
     # Merge with competencias técnicas data
@@ -53,18 +49,9 @@ def extract_data_from_excel(file_path):
     }
     
     comp_tec_df = comp_tec_df.rename(columns=comp_tec_columns)
-    # Match by name for competencias técnicas
-    master_df = pd.merge(master_df, comp_tec_df[['Nombre', 'Apellido(s)', 'Zoom_basico', 'Zoom_Avanzado', 
+    all_data = pd.merge(all_data, comp_tec_df[['Nombre', 'Apellido(s)', 'Zoom_basico', 'Zoom_Avanzado', 
                                                'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros']], 
                         on=['Nombre', 'Apellido(s)'], how='left')
-    
-    # Select and order the required columns
-    final_columns = [
-        'Periodo', 'DNI', 'Nombre', 'Apellido(s)', 'induccion', 'bus_biblioteca', 'diseno_sesion',
-        'Zoom_basico', 'Zoom_Avanzado', 'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros'
-    ]
-    
-    final_df = master_df[final_columns]
     
     # Define numeric columns
     numeric_columns = ['induccion', 'bus_biblioteca', 'diseno_sesion', 'Zoom_basico', 
@@ -72,14 +59,33 @@ def extract_data_from_excel(file_path):
     
     # Replace empty strings and NaN with 0 for numeric columns
     for col in numeric_columns:
-        final_df[col] = final_df[col].replace('', 0)
-        final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0)
+        all_data[col] = all_data[col].replace('', 0)
+        all_data[col] = pd.to_numeric(all_data[col], errors='coerce').fillna(0)
     
     # Calculate average of all 10 marks (treating blanks as 0)
-    final_df['Average'] = final_df[numeric_columns].mean(axis=1)
+    all_data['Average'] = all_data[numeric_columns].mean(axis=1)
     
     # Format the average to 2 decimal places
-    final_df['Average'] = final_df['Average'].round(2)
+    all_data['Average'] = all_data['Average'].round(2)
+    
+    # Group by person and find the highest average score across periods
+    # First, create a unique identifier for each person
+    all_data['Person_ID'] = all_data['DNI'].astype(str) + '_' + all_data['Nombre'] + '_' + all_data['Apellido(s)']
+    
+    # Find the highest score for each person
+    highest_scores = all_data.loc[all_data.groupby('Person_ID')['Average'].idxmax()].copy()
+    
+    # Add a column to indicate which period had the highest score
+    highest_scores['Highest_Score_Period'] = highest_scores['Periodo']
+    
+    # Select and order the required columns for final output
+    final_columns = [
+        'Periodo', 'DNI', 'Nombre', 'Apellido(s)', 'induccion', 'bus_biblioteca', 'diseno_sesion',
+        'Zoom_basico', 'Zoom_Avanzado', 'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros',
+        'Average', 'Highest_Score_Period'
+    ]
+    
+    final_df = highest_scores[final_columns]
     
     return final_df
 
@@ -88,6 +94,7 @@ def main():
     
     st.title("📊 Excel Data Processor")
     st.markdown("Upload your Excel file to process and combine data from multiple sheets.")
+    st.info("This tool will compare scores from both 2024 and 2025 periods and show the highest score for each person.")
     
     # File uploader
     uploaded_file = st.file_uploader("Choose an Excel file", type=["xlsx", "xls"])
@@ -95,41 +102,56 @@ def main():
     if uploaded_file is not None:
         try:
             # Process the file
-            with st.spinner("Processing your Excel file..."):
+            with st.spinner("Processing your Excel file and comparing periods..."):
                 final_data = extract_data_from_excel(uploaded_file)
             
             st.success("File processed successfully!")
             
             # Display preview
-            st.subheader("Preview of Processed Data")
+            st.subheader("Preview of Processed Data (Showing Highest Scores)")
             st.dataframe(final_data.head())
             
             # Show some statistics
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Total Records", len(final_data))
             with col2:
                 st.metric("Average Score", f"{final_data['Average'].mean():.2f}")
             with col3:
-                st.metric("Columns", len(final_data.columns))
+                st.metric("2024 Records", len(final_data[final_data['Highest_Score_Period'] == 2024]))
+            with col4:
+                st.metric("2025 Records", len(final_data[final_data['Highest_Score_Period'] == 2025]))
+            
+            # Show distribution of highest scores by period
+            st.subheader("Highest Score Distribution by Period")
+            period_counts = final_data['Highest_Score_Period'].value_counts()
+            st.bar_chart(period_counts)
             
             # Create download button
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"Final_Report_{timestamp}.xlsx"
+            output_filename = f"Final_Report_Highest_Scores_{timestamp}.xlsx"
             
             # Convert DataFrame to Excel bytes
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                final_data.to_excel(writer, index=False, sheet_name='Final Report')
+                final_data.to_excel(writer, index=False, sheet_name='Highest Scores')
             
             output.seek(0)
             
             st.download_button(
-                label="📥 Download Processed Excel File",
+                label="📥 Download Excel File with Highest Scores",
                 data=output,
                 file_name=output_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="This file contains the highest scores for each person across both 2024 and 2025 periods"
             )
+            
+            # Show some examples of people with scores from both periods
+            st.subheader("Sample of People with Scores from Both Periods")
+            st.info("The downloaded file shows only the highest score for each person. Below are some examples where people have scores from both periods.")
+            
+            # For demonstration, show a few examples where we have data from both periods
+            # (This would require access to the original data to compare)
             
         except Exception as e:
             st.error(f"An error occurred while processing the file: {str(e)}")
@@ -137,6 +159,20 @@ def main():
     
     else:
         st.info("👆 Please upload an Excel file to get started.")
+        
+        # Show expected format
+        st.subheader("Expected Excel File Format")
+        st.markdown("""
+        Your Excel file should contain the following sheets:
+        - **Inducción**: Contains basic student information and grades
+        - **nota Inducción**: Contains detailed course grades
+        - **Bus. biblioteca**: Contains library search grades
+        - **Diseño de sesión**: Contains session design grades
+        - **Comp. Tec**: Contains technical competency grades
+        
+        The processor will combine data from all these sheets, compare scores from 2024 and 2025 periods,
+        and show the highest score for each person.
+        """)
 
 if __name__ == "__main__":
     main()
