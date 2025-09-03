@@ -68,12 +68,22 @@ def extract_data_from_excel(file_path):
     # Format the average to 2 decimal places
     all_data['Average'] = all_data['Average'].round(2)
     
-    # Group by person and find the highest average score across periods
-    # First, create a unique identifier for each person
+    # Create a unique identifier for each person
     all_data['Person_ID'] = all_data['DNI'].astype(str) + '_' + all_data['Nombre'] + '_' + all_data['Apellido(s)']
     
-    # Find the highest score for each person
-    highest_scores = all_data.loc[all_data.groupby('Person_ID')['Average'].idxmax()].copy()
+    # Filter out records where average is 0 (no scores available)
+    all_data = all_data[all_data['Average'] > 0]
+    
+    # If no records with scores, return empty dataframe
+    if len(all_data) == 0:
+        return pd.DataFrame()
+    
+    # Group by person and find the highest average score across periods
+    # Get the index of the row with the maximum average for each person
+    idx = all_data.groupby('Person_ID')['Average'].idxmax()
+    
+    # Select the rows with the highest scores
+    highest_scores = all_data.loc[idx].copy()
     
     # Add a column to indicate which period had the highest score
     highest_scores['Highest_Score_Period'] = highest_scores['Periodo']
@@ -104,6 +114,10 @@ def main():
             # Process the file
             with st.spinner("Processing your Excel file and comparing periods..."):
                 final_data = extract_data_from_excel(uploaded_file)
+            
+            if len(final_data) == 0:
+                st.warning("No records with scores found in the uploaded file.")
+                return
             
             st.success("File processed successfully!")
             
@@ -149,9 +163,6 @@ def main():
             # Show some examples of people with scores from both periods
             st.subheader("Sample of People with Scores from Both Periods")
             st.info("The downloaded file shows only the highest score for each person. Below are some examples where people have scores from both periods.")
-            
-            # For demonstration, show a few examples where we have data from both periods
-            # (This would require access to the original data to compare)
             
         except Exception as e:
             st.error(f"An error occurred while processing the file: {str(e)}")
