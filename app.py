@@ -68,8 +68,8 @@ def extract_data_from_excel(file_path):
     # Format the average to 2 decimal places
     all_data['Average'] = all_data['Average'].round(2)
     
-    # Calculate marks out of 20 based on available marks only
-    def calculate_marks_out_of_20(row):
+    # Calculate percentage based on available components
+    def calculate_percentage(row):
         # Get the list of scores for the 10 components
         scores = row[numeric_columns].values
         # Count how many components have non-zero scores
@@ -78,26 +78,22 @@ def extract_data_from_excel(file_path):
         if available_components == 0:
             return 0
         
-        # Calculate the sum of available scores
-        total_score = sum(scores)
-        # Calculate average (sum of scores / number of available components)
-        average_score = total_score / available_components
-        # Convert to marks out of 20
-        marks_out_of_20 = average_score
-        return round(marks_out_of_20, 2)
-    
-    # Calculate percentage based on marks out of 20
-    def calculate_percentage(row):
-        marks_out_of_20 = row['Marks_Out_Of_20']
-        # Convert to percentage (marks out of 20 * 5)
-        percentage = marks_out_of_20 * 5
+        # Calculate the percentage (available_components / 10 * 100)
+        percentage = (available_components / 10) * 100
         return round(percentage, 2)
     
-    # Apply the marks out of 20 calculation to each row
-    all_data['Marks_Out_Of_20'] = all_data.apply(calculate_marks_out_of_20, axis=1)
+    # Calculate marks out of 20 based on percentage
+    def calculate_marks_out_of_20(row):
+        percentage = row['Percentage']
+        # Convert percentage to marks out of 20 (percentage / 5)
+        marks_out_of_20 = percentage / 5
+        return round(marks_out_of_20, 2)
     
     # Apply the percentage calculation to each row
     all_data['Percentage'] = all_data.apply(calculate_percentage, axis=1)
+    
+    # Apply the marks out of 20 calculation to each row
+    all_data['Marks_Out_Of_20'] = all_data.apply(calculate_marks_out_of_20, axis=1)
     
     # Create a unique identifier for each person
     all_data['Person_ID'] = all_data['DNI'].astype(str) + '_' + all_data['Nombre'] + '_' + all_data['Apellido(s)']
