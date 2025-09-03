@@ -68,6 +68,25 @@ def extract_data_from_excel(file_path):
     # Format the average to 2 decimal places
     all_data['Average'] = all_data['Average'].round(2)
     
+    # Calculate percentage based on available marks only
+    def calculate_percentage(row):
+        # Get the list of scores for the 10 components
+        scores = row[numeric_columns].values
+        # Count how many components have non-zero scores
+        available_components = sum(score > 0 for score in scores)
+        
+        if available_components == 0:
+            return 0
+        
+        # Calculate the sum of available scores
+        total_score = sum(scores)
+        # Calculate percentage (sum of scores / number of available components)
+        percentage = total_score / available_components
+        return round(percentage, 2)
+    
+    # Apply the percentage calculation to each row
+    all_data['Percentage'] = all_data.apply(calculate_percentage, axis=1)
+    
     # Create a unique identifier for each person
     all_data['Person_ID'] = all_data['DNI'].astype(str) + '_' + all_data['Nombre'] + '_' + all_data['Apellido(s)']
     
@@ -92,7 +111,7 @@ def extract_data_from_excel(file_path):
     final_columns = [
         'Periodo', 'DNI', 'Nombre', 'Apellido(s)', 'induccion', 'bus_biblioteca', 'diseno_sesion',
         'Zoom_basico', 'Zoom_Avanzado', 'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros',
-        'Average', 'Highest_Score_Period'
+        'Average', 'Percentage', 'Highest_Score_Period'
     ]
     
     final_df = highest_scores[final_columns]
@@ -132,8 +151,12 @@ def main():
             with col2:
                 st.metric("Average Score", f"{final_data['Average'].mean():.2f}")
             with col3:
-                st.metric("2024 Records", len(final_data[final_data['Highest_Score_Period'] == 2024]))
+                st.metric("Average Percentage", f"{final_data['Percentage'].mean():.2f}")
             with col4:
+                st.metric("2024 Records", len(final_data[final_data['Highest_Score_Period'] == 2024]))
+            
+            col5, col6, col7, col8 = st.columns(4)
+            with col5:
                 st.metric("2025 Records", len(final_data[final_data['Highest_Score_Period'] == 2025]))
             
             # Show distribution of highest scores by period
