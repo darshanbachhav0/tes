@@ -7,10 +7,10 @@ import re
 from datetime import datetime
 
 # -----------------------------
-# Helpers
+# Light, fast helpers
 # -----------------------------
 def normalize_dni_value(x):
-    """Normalize DNI to a plain digit string (e.g., 12345678), handling floats like '12345678.0'."""
+    """Normalize DNI to digits only (e.g., '12345678.0' -> '12345678')."""
     if pd.isna(x):
         return np.nan
     s = str(x).strip()
@@ -19,111 +19,107 @@ def normalize_dni_value(x):
     s = re.sub(r'\D', '', s)
     return s if s else np.nan
 
-def extract_year(value):
-    """
-    Extract a 4-digit year (20xx) from 'Periodo' fields that might look like:
-    2024, '2024-I', '2025-II', '2025', etc.
-    """
-    if pd.isna(value):
-        return pd.NA
-    s = str(value)
-    m = re.search(r'(20\d{2})', s)
-    return int(m.group(1)) if m else pd.NA
+def clean_series(s):
+    return s.astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
 
-def load_teacher_contract(contract_file):
-    """
-    Load the teacher contract file and extract ['DNI','Nombre','Apellido(s)'].
-    Tolerant with header variations.
-    """
-    df = pd.read_excel(contract_file, sheet_name=0)
-    cols = {c.strip(): c for c in df.columns if isinstance(c, str)}
+def load_teacher_contract_from_bytes(contract_bytes):
+    """Read minimal columns from the teacher contract, robust to header variants."""
+    xf = pd.ExcelFile(io.BytesIO(contract_bytes))
+    df = xf.parse(0)  # first sheet
+    # Build a case-insensitive lookup over raw columns
+    raw_cols = {str(c).strip(): c for c in df.columns}
+    def find_col(options):
+        for opt in options:
+            if opt in raw_cols:
+                return raw_cols[opt]
+        # fallback: fuzzy search
+        for c in df.columns:
+            s = str(c).upper()
+            if 'DOCUMENTO' in s and 'IDENTIDAD' in s:
+                return c
+        return None
 
-    dni_col = None
-    for k in [
+    dni_col = find_col([
         'N° DE DOCUMENTO DE IDENTIDAD', 'N° DE DOCUMENTO DE IDENTIDAD ',
         'NRO DE DOCUMENTO DE IDENTIDAD', 'NRO DE DOCUMENTO', 'NRO DE DOCUMENTO'
-    ]:
-        if k in cols:
-            dni_col = cols[k]
-            break
-    if dni_col is None:
-        for c in df.columns:
-            if isinstance(c, str) and 'DOCUMENTO' in c.upper() and 'IDENTIDAD' in c.upper():
-                dni_col = c
-                break
+    ])
+    name_col   = raw_cols.get('NOMBRES', raw_cols.get('Nombres', None))
+    a_pat_col  = raw_cols.get('APELLIDO PATERNO', raw_cols.get('Apellido Paterno', None))
+    a_mat_col  = raw_cols.get('APELLIDO MATERNO', raw_cols.get('Apellido Materno', None))
 
-    name_col = cols.get('NOMBRES', cols.get('Nombres', None))
-    a_pat_col = cols.get('APELLIDO PATERNO', cols.get('Apellido Paterno', None))
-    a_mat_col = cols.get('APELLIDO MATERNO', cols.get('Apellido Materno', None))
-
-    if dni_col is None or name_col is None or a_pat_col is None or a_mat_col is None:
+    if not all([dni_col, name_col, a_pat_col, a_mat_col]):
         return pd.DataFrame(columns=['DNI', 'Nombre', 'Apellido(s)'])
 
     out = pd.DataFrame({
         'DNI': df[dni_col].apply(normalize_dni_value),
-        'Nombre': df[name_col].astype(str).str.strip(),  # <-- fixed: use .str.strip()
-        'Apellido(s)': (
-            df[a_pat_col].astype(str).str.strip() + ' ' +
-            df[a_mat_col].astype(str).str.strip()
-        ).str.replace(r'\s+', ' ', regex=True).str.strip()
+        'Nombre': clean_series(df[name_col]),
+        'Apellido(s)': clean_series(df[a_pat_col]) + ' ' + clean_series(df[a_mat_col])
     })
     out = out.dropna(subset=['DNI'])
-    out = out[out['DNI'] != '']
-    out = out.drop_duplicates(subset=['DNI'])
+    out = out[out['DNI'] != ''].drop_duplicates(subset=['DNI'])
     return out[['DNI', 'Nombre', 'Apellido(s)']]
 
 # -----------------------------
-# Core processing
+# Core processing (vectorized & trimmed)
 # -----------------------------
-def extract_data_from_excel(file_path, contract_file=None):
-    # ---- Read all source sheets
-    induction_df       = pd.read_excel(file_path, sheet_name='Inducción')
-    nota_induccion_df  = pd.read_excel(file_path, sheet_name='nota Inducción')
-    bus_biblioteca_df  = pd.read_excel(file_path, sheet_name='Bus. biblioteca')
-    diseno_sesion_df   = pd.read_excel(file_path, sheet_name='Diseño de sesión')
-    comp_tec_df        = pd.read_excel(file_path, sheet_name='Comp. Tec')
-    integracion_df     = pd.read_excel(file_path, sheet_name='Integración')
-    rsu_df             = pd.read_excel(file_path, sheet_name='RSU')
-    estress_df         = pd.read_excel(file_path, sheet_name='estress')
-    hab_com_df         = pd.read_excel(file_path, sheet_name='Hab. comunicación')
+def extract_data_from_excel_bytes(master_bytes, contract_bytes=None):
+    xf = pd.ExcelFile(io.BytesIO(master_bytes))
 
-    # ---- Prepare base: Inducción + nota Inducción (unified columns)
-    nota_induccion_clean = nota_induccion_df[
-        ['PERIODO', 'DNI', 'Nombre', 'Apellido(s)', 'Dirección de correo', 'Total del curso (Real)']
-    ].copy()
-    nota_induccion_clean = nota_induccion_clean.rename(columns={
-        'PERIODO': 'Periodo',
-        'Total del curso (Real)': 'induccion'
-    })
+    # 1) Base from Inducción + nota Inducción
+    induccion = xf.parse('Inducción', usecols=['Periodo', 'DNI', 'Nombre', 'Apellido(s)', 'Dirección de correo', 'Calificación'])
+    induccion = induccion.rename(columns={'Calificación': 'induccion'})
+    nota_ind = xf.parse('nota Inducción', usecols=['PERIODO', 'DNI', 'Nombre', 'Apellido(s)', 'Dirección de correo', 'Total del curso (Real)'])
+    nota_ind = nota_ind.rename(columns={'PERIODO': 'Periodo', 'Total del curso (Real)': 'induccion'})
+    all_data = pd.concat([nota_ind, induccion], ignore_index=True)
 
-    induction_clean = induction_df[
-        ['Periodo', 'DNI', 'Nombre', 'Apellido(s)', 'Dirección de correo', 'Calificación']
-    ].copy()
-    induction_clean = induction_clean.rename(columns={'Calificación': 'induccion'})
-
-    all_data = pd.concat([nota_induccion_clean, induction_clean], ignore_index=True)
-
-    # Normalize DNI and derive Year
+    # Normalize IDs & names
     all_data['DNI'] = all_data['DNI'].apply(normalize_dni_value)
-    all_data['Year'] = all_data['Periodo'].apply(extract_year)
+    all_data['Nombre'] = clean_series(all_data['Nombre'])
+    all_data['Apellido(s)'] = clean_series(all_data['Apellido(s)'])
 
-    # ---- Bus. biblioteca (by DNI)
-    bus_biblioteca_df['DNI'] = bus_biblioteca_df['DNI'].apply(normalize_dni_value)
-    bus_biblioteca_df = bus_biblioteca_df.rename(columns={'Promedio': 'bus_biblioteca'})
-    all_data = pd.merge(
-        all_data, bus_biblioteca_df[['DNI', 'bus_biblioteca']],
-        on='DNI', how='left'
+    # Vectorized Year from Periodo (handles '2024', '2024-I', etc.)
+    all_data['Year'] = (
+        all_data['Periodo'].astype(str)
+        .str.extract(r'(20\d{2})', expand=False)
+        .astype('Int64')
     )
 
-    # ---- Diseño de sesión (join by names)
-    diseno_sesion_df = diseno_sesion_df.rename(columns={'Promedio': 'diseno_sesion'})
-    all_data = pd.merge(
-        all_data, diseno_sesion_df[['Nombre', 'Apellido(s)', 'diseno_sesion']],
-        on=['Nombre', 'Apellido(s)'], how='left'
-    )
+    # 2) Optionally restrict to DNIs in Teacher Contract early (shrinks work)
+    contract = None
+    if contract_bytes is not None:
+        contract = load_teacher_contract_from_bytes(contract_bytes)
+        if not contract.empty:
+            dnis = set(contract['DNI'])
+            all_data = all_data[all_data['DNI'].isin(dnis)]
 
-    # ---- Comp. Tec (join by names)
-    comp_tec_columns = {
+    # If nothing left, stop early
+    if all_data.empty:
+        return pd.DataFrame()
+
+    # Convenience: only keep periods we care about asap
+    all_data = all_data[all_data['Year'].isin([2024, 2025])]
+
+    # 3) Bring in the rest, reading only necessary cols and trimming to relevant DNIs where possible
+    needed_dnis = set(all_data['DNI'].dropna())
+
+    # Bus. biblioteca (by DNI)
+    bus_bib = xf.parse('Bus. biblioteca', usecols=['DNI', 'Promedio'])
+    bus_bib['DNI'] = bus_bib['DNI'].apply(normalize_dni_value)
+    if needed_dnis:
+        bus_bib = bus_bib[bus_bib['DNI'].isin(needed_dnis)]
+    bus_bib = bus_bib.rename(columns={'Promedio': 'bus_biblioteca'})
+    all_data = all_data.merge(bus_bib, on='DNI', how='left')
+
+    # Diseño de sesión (by names)
+    dis_ses = xf.parse('Diseño de sesión', usecols=['Nombre', 'Apellido(s)', 'Promedio'])
+    dis_ses = dis_ses.rename(columns={'Promedio': 'diseno_sesion'})
+    dis_ses['Nombre'] = clean_series(dis_ses['Nombre'])
+    dis_ses['Apellido(s)'] = clean_series(dis_ses['Apellido(s)'])
+    all_data = all_data.merge(dis_ses, on=['Nombre', 'Apellido(s)'], how='left')
+
+    # Comp. Tec (by names)
+    comp = xf.parse('Comp. Tec')
+    comp_map = {
         'Cuestionario:Reto: Zoom básico': 'Zoom_basico',
         'Cuestionario:Reto: Zoom Avanzado': 'Zoom_Avanzado',
         'Cuestionario:Reto: Grupos Moodle': 'Grupos_Moodle',
@@ -132,104 +128,87 @@ def extract_data_from_excel(file_path, contract_file=None):
         'Cuestionario:Reto: Nearpod': 'Nearpod',
         'Cuestionario:Reto: Tareas y foros': 'Tareas_y_foros'
     }
-    comp_tec_df = comp_tec_df.rename(columns=comp_tec_columns)
-    all_data = pd.merge(
-        all_data,
-        comp_tec_df[['Nombre', 'Apellido(s)', 'Zoom_basico', 'Zoom_Avanzado',
-                     'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros']],
-        on=['Nombre', 'Apellido(s)'], how='left'
-    )
+    keep_cols = ['Nombre', 'Apellido(s)'] + [k for k in comp_map.keys() if k in comp.columns]
+    comp = comp[keep_cols].rename(columns=comp_map)
+    comp['Nombre'] = clean_series(comp['Nombre'])
+    comp['Apellido(s)'] = clean_series(comp['Apellido(s)'])
+    all_data = all_data.merge(comp, on=['Nombre', 'Apellido(s)'], how='left')
 
-    # ---- Integración (join by names)
-    integracion_df = integracion_df.rename(columns={
-        'Tarea:Producto final: Contenido académico, presentación y rúbrica con IA (Real)': 'integracion'
-    })
-    all_data = pd.merge(
-        all_data, integracion_df[['Nombre', 'Apellido(s)', 'integracion']],
-        on=['Nombre', 'Apellido(s)'], how='left'
-    )
+    # Integración (by names)
+    integ = xf.parse('Integración')
+    integ_col = 'Tarea:Producto final: Contenido académico, presentación y rúbrica con IA (Real)'
+    if integ_col in integ.columns:
+        integ = integ[['Nombre', 'Apellido(s)', integ_col]].rename(columns={integ_col: 'integracion'})
+        integ['Nombre'] = clean_series(integ['Nombre'])
+        integ['Apellido(s)'] = clean_series(integ['Apellido(s)'])
+        all_data = all_data.merge(integ, on=['Nombre', 'Apellido(s)'], how='left')
+    else:
+        all_data['integracion'] = np.nan
 
-    # ---- RSU (by DNI)
-    rsu_df['DNI'] = rsu_df['DNI'].apply(normalize_dni_value)
-    rsu_df = rsu_df.rename(columns={'Tarea: Producto final': 'rsu'})
-    all_data = pd.merge(
-        all_data, rsu_df[['DNI', 'rsu']],
-        on='DNI', how='left'
-    )
+    # RSU (by DNI)
+    rsu = xf.parse('RSU', usecols=['DNI', 'Tarea: Producto final'])
+    rsu['DNI'] = rsu['DNI'].apply(normalize_dni_value)
+    if needed_dnis:
+        rsu = rsu[rsu['DNI'].isin(needed_dnis)]
+    rsu = rsu.rename(columns={'Tarea: Producto final': 'rsu'})
+    all_data = all_data.merge(rsu, on='DNI', how='left')
 
-    # ---- estress (by DNI)
-    estress_df['DNI'] = estress_df['DNI'].apply(normalize_dni_value)
-    estress_df = estress_df.rename(columns={'Tarea:Producto final': 'estress'})
-    all_data = pd.merge(
-        all_data, estress_df[['DNI', 'estress']],
-        on='DNI', how='left'
-    )
+    # estress (by DNI)
+    est = xf.parse('estress', usecols=['DNI', 'Tarea:Producto final'])
+    est['DNI'] = est['DNI'].apply(normalize_dni_value)
+    if needed_dnis:
+        est = est[est['DNI'].isin(needed_dnis)]
+    est = est.rename(columns={'Tarea:Producto final': 'estress'})
+    all_data = all_data.merge(est, on='DNI', how='left')
 
-    # ---- Hab. comunicación (by DNI)
-    hab_com_df['DNI'] = hab_com_df['DNI'].apply(normalize_dni_value)
-    hab_com_df = hab_com_df.rename(columns={'Tarea:Producto final': 'hab_comunicacion'})
-    all_data = pd.merge(
-        all_data, hab_com_df[['DNI', 'hab_comunicacion']],
-        on='DNI', how='left'
-    )
+    # Hab. comunicación (by DNI)
+    hab = xf.parse('Hab. comunicación', usecols=['DNI', 'Tarea:Producto final'])
+    hab['DNI'] = hab['DNI'].apply(normalize_dni_value)
+    if needed_dnis:
+        hab = hab[hab['DNI'].isin(needed_dnis)]
+    hab = hab.rename(columns={'Tarea:Producto final': 'hab_comunicacion'})
+    all_data = all_data.merge(hab, on='DNI', how='left')
 
-    # ---- Teacher Contract (optional but recommended)
-    if contract_file is not None:
-        contract = load_teacher_contract(contract_file)
-        contract['DNI'] = contract['DNI'].apply(normalize_dni_value)
-        contract = contract.dropna(subset=['DNI'])
-
-        # Keep only DNIs present in contract
-        all_data = all_data[all_data['DNI'].isin(contract['DNI'])]
-
-        # Fill names from contract when missing
-        all_data = pd.merge(
-            all_data, contract, on='DNI', how='left', suffixes=('', '_contract')
-        )
+    # 4) Fill names from contract (only where missing)
+    if contract is not None and not contract.empty:
+        all_data = all_data.merge(contract, on='DNI', how='left', suffixes=('', '_contract'))
         all_data['Nombre'] = all_data['Nombre'].fillna(all_data['Nombre_contract'])
         all_data['Apellido(s)'] = all_data['Apellido(s)'].fillna(all_data['Apellido(s)_contract'])
-        all_data = all_data.drop(columns=['Nombre_contract', 'Apellido(s)_contract'])
+        all_data = all_data.drop(columns=['Nombre_contract', 'Apellido(s)_contract'], errors='ignore')
 
-    # ---- Numeric components (14 total)
-    numeric_columns = [
+    # 5) Coerce numeric components (vectorized)
+    numeric_cols = [
         'induccion', 'bus_biblioteca', 'diseno_sesion',
         'Zoom_basico', 'Zoom_Avanzado', 'Grupos_Moodle', 'Rubrica',
         'Padlet', 'Nearpod', 'Tareas_y_foros',
         'integracion', 'rsu', 'estress', 'hab_comunicacion'
     ]
-    for col in numeric_columns:
-        all_data[col] = pd.to_numeric(all_data[col], errors='coerce').fillna(0)
+    for c in numeric_cols:
+        if c not in all_data.columns:
+            all_data[c] = np.nan
+    all_data[numeric_cols] = all_data[numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
 
-    # ---- Compute metrics
-    all_data['Average'] = all_data[numeric_columns].mean(axis=1).round(2)
-
-    def calculate_percentage(row):
-        scores = row[numeric_columns].values
-        available = int(np.sum(np.array(scores) > 0))
-        return round(available / len(numeric_columns) * 100, 2) if len(numeric_columns) else 0.0
-
-    all_data['Percentage'] = all_data.apply(calculate_percentage, axis=1)
-    all_data['Marks_Out_Of_20'] = (all_data['Percentage'] / 5).round(2)
-
-    # ---- Only compare 2024 vs 2025 and keep rows with any score
-    filtered = all_data[all_data['Year'].isin([2024, 2025])].copy()
-    filtered = filtered[filtered[numeric_columns].sum(axis=1) > 0]
-
-    if filtered.empty:
+    # Keep only rows with any non-zero score
+    nonzero_mask = (all_data[numeric_cols].sum(axis=1) > 0)
+    all_data = all_data[nonzero_mask]
+    if all_data.empty:
         return pd.DataFrame()
 
-    # ---- DEDUP: one row per teacher (by DNI) with the HIGHEST Marks_Out_Of_20 across 2024 & 2025
-    # Tie-breaker: higher Average, then prefer 2025 over 2024
-    filtered['YearPref'] = filtered['Year'].apply(lambda y: 1 if y == 2025 else 0)
-    sorted_df = filtered.sort_values(
-        by=['Marks_Out_Of_20', 'Average', 'YearPref'],
-        ascending=[False, False, False]
-    )
-    highest = sorted_df.drop_duplicates(subset=['DNI'], keep='first').copy()
+    # Metrics (fully vectorized)
+    all_data['Average'] = all_data[numeric_cols].mean(axis=1).round(2)
+    non_zero_count = (all_data[numeric_cols] > 0).sum(axis=1)
+    all_data['Percentage'] = ((non_zero_count / len(numeric_cols)) * 100).round(2)
+    all_data['Marks_Out_Of_20'] = (all_data['Percentage'] / 5).round(2)
+
+    # 6) Dedup to ONE row per teacher (best of 2024 vs 2025)
+    # Prefer: higher Marks_Out_Of_20, then higher Average, then 2025
+    yearpref = (all_data['Year'] == 2025).astype(int)
+    all_data['_YearPref'] = yearpref
+    all_data = all_data.sort_values(by=['Marks_Out_Of_20', 'Average', '_YearPref'], ascending=[False, False, False])
+    highest = all_data.drop_duplicates(subset=['DNI'], keep='first').copy()
     highest['Highest_Score_Year'] = highest['Year']
 
-    # ---- Final column order
-    final_columns = [
+    final_cols = [
         'Periodo', 'Highest_Score_Year', 'DNI', 'Nombre', 'Apellido(s)',
         'induccion', 'bus_biblioteca', 'diseno_sesion',
         'Zoom_basico', 'Zoom_Avanzado', 'Grupos_Moodle', 'Rubrica',
@@ -237,96 +216,62 @@ def extract_data_from_excel(file_path, contract_file=None):
         'integracion', 'rsu', 'estress', 'hab_comunicacion',
         'Average', 'Marks_Out_Of_20', 'Percentage'
     ]
-    final_df = highest[final_columns]
-    return final_df
+    # Some sheets may miss certain columns; guard selection
+    final_cols = [c for c in final_cols if c in highest.columns]
+    return highest[final_cols].reset_index(drop=True)
+
+# Optional caching (speeds re-runs with the same files during a session)
+@st.cache_data(show_spinner=False, ttl=3600)
+def process_cached(master_bytes, contract_bytes):
+    return extract_data_from_excel_bytes(master_bytes, contract_bytes)
 
 # -----------------------------
-# Streamlit App
+# Streamlit App (lean UI)
 # -----------------------------
 def main():
     st.set_page_config(page_title="📊 UMA Scores (Highest of 2024 vs 2025)", page_icon="📊", layout="wide")
-
     st.title("📊 UMA Scores — Highest Marks (2024 vs 2025)")
-    st.markdown(
-        "Upload the **Master** Excel and the **Teacher Contract** Excel. "
-        "The output will contain **only one row per teacher (no duplicates)** — "
-        "the row corresponding to the **highest _Marks Out Of 20_ between 2024 and 2025**."
-    )
+    st.caption("Optimized for fast processing on Render (single-pass Excel parsing, trimmed columns, vectorized ops).")
 
-    # File uploaders
-    uploaded_file = st.file_uploader("Choose the Master Excel file", type=["xlsx", "xls"], key="master")
-    uploaded_contract = st.file_uploader("Choose the Teacher Contract Excel file", type=["xlsx", "xls"], key="contract")
+    master_file = st.file_uploader("Master Excel", type=["xlsx", "xls"])
+    contract_file = st.file_uploader("Teacher Contract Excel", type=["xlsx", "xls"])
 
-    if uploaded_file is not None and uploaded_contract is not None:
+    if master_file and contract_file:
         try:
-            with st.spinner("Processing your Excel files and comparing 2024 vs 2025..."):
-                final_data = extract_data_from_excel(uploaded_file, contract_file=uploaded_contract)
+            master_bytes = master_file.getvalue()
+            contract_bytes = contract_file.getvalue()
 
-            if len(final_data) == 0:
-                st.warning("No records with scores found for 2024 or 2025.")
+            with st.spinner("Processing…"):
+                final_df = process_cached(master_bytes, contract_bytes)
+
+            if final_df.empty:
+                st.warning("No records with non-zero scores for 2024/2025 after filtering.")
                 return
 
-            st.success("Done! Showing only the highest marks per teacher (no duplicates).")
+            st.success(f"Done. Unique teachers: {len(final_df)}")
+            st.dataframe(final_df.head(30), use_container_width=True)
 
-            # Preview
-            st.subheader("Preview")
-            st.dataframe(final_data.head(30))
-
-            # Metrics
+            # Lightweight metrics (no charts)
             col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Teachers", len(final_data))
-            with col2:
-                st.metric("Avg Marks (Out of 20)", f"{final_data['Marks_Out_Of_20'].mean():.2f}")
-            with col3:
-                st.metric("Avg Percentage", f"{final_data['Percentage'].mean():.2f}%")
-
-            st.subheader("Distribution by Highest Score Year")
-            year_counts = final_data['Highest_Score_Year'].value_counts().sort_index()
-            st.bar_chart(year_counts)
+            col1.metric("Teachers", len(final_df))
+            col2.metric("Avg Marks/20", f"{final_df['Marks_Out_Of_20'].mean():.2f}")
+            col3.metric("Avg %", f"{final_df['Percentage'].mean():.2f}%")
 
             # Download
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"Highest_Marks_2024_vs_2025_{timestamp}.xlsx"
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                final_data.to_excel(writer, index=False, sheet_name='Highest Marks (Unique)')
-            output.seek(0)
-
-            st.download_button(
-                label="📥 Download (Unique, Highest of 2024/2025)",
-                data=output,
-                file_name=output_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = f"Highest_Marks_2024_vs_2025_{ts}.xlsx"
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as w:
+                final_df.to_excel(w, index=False, sheet_name='Highest Marks (Unique)')
+            buf.seek(0)
+            st.download_button("📥 Download", buf,
+                               file_name=fname,
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except Exception as e:
-            st.error(f"Error while processing: {str(e)}")
-            st.info(
-                "Ensure your Master file contains these sheets: "
-                "'Inducción', 'nota Inducción', 'Bus. biblioteca', 'Diseño de sesión', 'Comp. Tec', "
-                "'Integración', 'RSU', 'estress', 'Hab. comunicación'. "
-                "Teacher Contract file should include DNI and names."
-            )
+            st.error(f"Processing error: {e}")
+            st.info("Check sheet names/columns and try again.")
     else:
-        st.info("👆 Please upload both the Master Excel and the Teacher Contract Excel to get started.")
-
-        st.subheader("Expected Columns (quick reference)")
-        st.markdown("""
-        **Master Excel**:
-        - **Inducción**: `Periodo`, `DNI`, `Nombre`, `Apellido(s)`, `Dirección de correo`, `Calificación`
-        - **nota Inducción**: `PERIODO`, `DNI`, `Nombre`, `Apellido(s)`, `Dirección de correo`, `Total del curso (Real)`
-        - **Bus. biblioteca**: `DNI`, `Promedio`
-        - **Diseño de sesión**: `Nombre`, `Apellido(s)`, `Promedio`
-        - **Comp. Tec**: `Reto` columns (Zoom básico, Zoom Avanzado, Grupos Moodle, Rúbrica, Padlet, Nearpod, Tareas y foros)
-        - **Integración**: `Tarea:Producto final: Contenido académico, presentación y rúbrica con IA (Real)`
-        - **RSU**: `Tarea: Producto final`
-        - **estress**: `Tarea:Producto final`
-        - **Hab. comunicación**: `Tarea:Producto final`
-
-        **Teacher Contract**:
-        - `N° DE DOCUMENTO DE IDENTIDAD` (DNI), `NOMBRES`, `APELLIDO PATERNO`, `APELLIDO MATERNO`.
-        """)
+        st.info("Upload both files to begin.")
 
 if __name__ == "__main__":
     main()
