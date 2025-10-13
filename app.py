@@ -73,10 +73,11 @@ def load_teacher_email_roster(roster_file):
     else:
         df = wb
 
-    email_col = find_col(df, ["correo", "email", "e-mail", "mail"],
-                         prefer_exact=["Dirección de correo", "Correo", "Email", "E-mail"])
+    email_col = find_col(
+        df, ["correo", "email", "e-mail", "mail"],
+        prefer_exact=["Dirección de correo", "Correo", "Email", "E-mail"]
+    )
     if email_col is None:
-        # Heuristic: pick a column where many values look like emails
         for c in df.columns:
             frac = df[c].astype(str).str.contains("@", na=False).mean()
             if frac > 0.3:
@@ -111,12 +112,7 @@ def load_teacher_email_roster(roster_file):
     out = out.dropna(subset=["Email"]).drop_duplicates(subset=["Email"])
     return out[["Email", "Nombre", "Apellido(s)"]]
 
-# ---------- workbook reading (robust, once) ----------
 def read_workbook(file):
-    """
-    Read all sheets once and return a dict: {normalized_name: DataFrame}.
-    Normalization is lowercase + accent/space removal.
-    """
     raw = pd.read_excel(file, sheet_name=None, dtype=str, engine="openpyxl")
     book = {}
     for name, df in raw.items():
@@ -125,25 +121,34 @@ def read_workbook(file):
     return book
 
 def get_sheet(book, possible_names):
-    """
-    Return first matching sheet by fuzzy names (list of strings).
-    """
     keys = list(book.keys())
     for candidate in possible_names:
         cand = strip_accents(candidate).replace(" ", "")
-        # exact or contains
         for k in keys:
             if cand == k or cand in k or k in cand:
                 return book[k].copy()
     return None
 
+def coalesce_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """After merges, collapse *_x/*_y to clean keys."""
+    for key in ["Email", "DNI", "Nombre", "Apellido(s)"]:
+        kx, ky = f"{key}_x", f"{key}_y"
+        if kx in df.columns or ky in df.columns:
+            if key not in df.columns:
+                df[key] = pd.NA
+            if kx in df.columns:
+                df[key] = df[key].where(df[key].notna(), df[kx])
+            if ky in df.columns:
+                df[key] = df[key].where(df[key].notna(), df[ky])
+            df = df.drop(columns=[c for c in [kx, ky] if c in df.columns])
+    return df
+
 # -----------------------------
 # Core processing
 # -----------------------------
-def extract_data_from_excel(master_file, roster_file=None, debug=False):
-    # --- Read master workbook once
+def extract_data_from_excel(master_file, roster_file=None):
+    # Read master workbook once
     book = read_workbook(master_file)
-    # identify all likely sheets
     df_induccion      = get_sheet(book, ["inducción", "induccion"])
     df_nota_ind       = get_sheet(book, ["nota inducción", "nota induccion"])
     df_biblio         = get_sheet(book, ["bus. biblioteca", "biblioteca", "bus biblioteca"])
@@ -154,11 +159,9 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
     df_estress        = get_sheet(book, ["estress", "estres", "estrés"])
     df_habcom         = get_sheet(book, ["hab. comunicación", "hab comunicacion", "habilidades comunicacion"])
 
-    # Fail fast if the two base sheets are missing
     if df_induccion is None and df_nota_ind is None:
         raise ValueError("Neither 'Inducción' nor 'nota Inducción' sheet found in Master file.")
 
-    # ---- base union (the two induction-type sheets)
     frames = []
     if df_nota_ind is not None:
         cols_keep = ["PERIODO", "DNI", "Nombre", "Apellido(s)", "Dirección de correo", "Total del curso (Real)"]
@@ -180,38 +183,35 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
 
     all_data = pd.concat(frames, ignore_index=True)
 
-    # Normalize ids
-    if "DNI" in all_data.columns:
-        all_data["DNI"] = all_data["DNI"].apply(normalize_dni_value)
-    else:
-        all_data["DNI"] = pd.NA
-
+    # Normalize base ids
+    all_data["DNI"] = all_data["DNI"].apply(normalize_dni_value) if "DNI" in all_data.columns else pd.NA
     if "Dirección de correo" in all_data.columns:
         all_data["Email"] = all_data["Dirección de correo"].apply(normalize_email)
     else:
         all_data["Email"] = pd.NA
-
     all_data["Year"] = all_data["Periodo"].apply(extract_year) if "Periodo" in all_data.columns else pd.NA
 
-    # ---- helper for email/dni/name join
+    # Generic merge helper that avoids Email_x/Email_y
+    def smart_merge(left: pd.DataFrame, right: pd.DataFrame, left_on, right_on, how="left"):
+        # If the keys are the same string, use 'on=' to prevent _x/_y
+        if isinstance(left_on, str) and isinstance(right_on, str) and left_on == right_on:
+            out = pd.merge(left, right, on=left_on, how=how)
+        else:
+            out = pd.merge(left, right, left_on=left_on, right_on=right_on, how=how)
+        return coalesce_keys(out)
+
+    # Helper to add a sheet with multiple possible join keys
     def add_by_key(src_df, mapping, left_on_opts, how="left"):
-        """
-        src_df: DataFrame to merge in
-        mapping: dict of {source_col_name_in_src_df: new_col_name}
-        left_on_opts: list of tuples like ("Email", email_col_in_src), ("DNI", dni_col), (["Nombre","Apellido(s)"], ["Nombre","Apellido(s)"])
-        Try each option in order if columns exist.
-        """
         nonlocal all_data
         if src_df is None:
             return
-        # rename mapping columns if present
         src = src_df.copy()
         for old, new in list(mapping.items()):
             if old in src.columns:
                 src = src.rename(columns={old: new})
 
         for left_on, right_on in left_on_opts:
-            # check presence
+            # presence check
             if isinstance(left_on, list):
                 left_ok = all(col in all_data.columns for col in left_on)
             else:
@@ -223,21 +223,22 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
             if not (left_ok and right_ok):
                 continue
 
-            # normalize email/dni if used
-            if (isinstance(right_on, str) and "correo" in strip_accents(right_on)) or right_on == "Email":
+            # normalize right keys
+            if (isinstance(right_on, str) and ("correo" in strip_accents(right_on) or right_on == "Email")):
                 src["Email"] = src[right_on].apply(normalize_email)
+                right_on = "Email"
             if right_on == "DNI":
                 src["DNI"] = src["DNI"].apply(normalize_dni_value)
 
-            # do the merge
-            all_data = pd.merge(all_data, src, left_on=left_on, right_on=right_on, how=how)
-            return  # merged once; stop trying
+            all_data = smart_merge(all_data, src, left_on, right_on, how=how)
+            return  # done once
 
-    # ---- Bus. biblioteca
+    # Bus. biblioteca
     if df_biblio is not None:
+        prom = find_col(df_biblio, ["promedio"]) or "Promedio"
+        df_biblio = df_biblio.rename(columns={prom: "bus_biblioteca"}) if prom in df_biblio.columns else df_biblio
         add_by_key(
-            df_biblio,
-            mapping={"Promedio": "bus_biblioteca"},
+            df_biblio, mapping={},
             left_on_opts=[
                 ("Email", find_col(df_biblio, ["correo", "email"]) or "Email"),
                 ("DNI", "DNI"),
@@ -245,17 +246,12 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
             ]
         )
 
-    # ---- Diseño de sesión (usually by names)
+    # Diseño de sesión (usually by names)
     if df_diseno is not None:
         prom_col = find_col(df_diseno, ["promedio"]) or "Promedio"
-        if prom_col in df_diseno.columns:
-            df_tmp = df_diseno.rename(columns={prom_col: "diseno_sesion"})
-        else:
-            df_tmp = df_diseno.copy()
-            df_tmp["diseno_sesion"] = pd.NA
+        df_tmp = df_diseno.rename(columns={prom_col: "diseno_sesion"}) if prom_col in df_diseno.columns else df_diseno.copy()
         add_by_key(
-            df_tmp,
-            mapping={},  # already renamed
+            df_tmp, mapping={},
             left_on_opts=[
                 (["Nombre", "Apellido(s)"], ["Nombre", "Apellido(s)"]),
                 ("Email", find_col(df_tmp, ["correo", "email"]) or "Email"),
@@ -263,7 +259,7 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
             ]
         )
 
-    # ---- Comp. Tec
+    # Comp. Tec
     if df_comptec is not None:
         ren = {
             "Cuestionario:Reto: Zoom básico": "Zoom_basico",
@@ -276,8 +272,7 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
         }
         df_tmp = df_comptec.rename(columns={k: v for k, v in ren.items() if k in df_comptec.columns})
         add_by_key(
-            df_tmp,
-            mapping={},  # already renamed
+            df_tmp, mapping={},
             left_on_opts=[
                 (["Nombre", "Apellido(s)"], ["Nombre", "Apellido(s)"]),
                 ("Email", find_col(df_tmp, ["correo", "email"]) or "Email"),
@@ -285,16 +280,12 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
             ]
         )
 
-    # ---- Integración
+    # Integración
     if df_integracion is not None:
-        # try several possible column titles
         integ_col = None
         for cand in [
             "Tarea:Producto final: Contenido académico, presentación y rúbrica con IA (Real)",
-            "Tarea:Producto final",
-            "Producto final",
-            "Integración",
-            "Integracion",
+            "Tarea:Producto final", "Producto final", "Integración", "Integracion"
         ]:
             if cand in df_integracion.columns:
                 integ_col = cand
@@ -303,8 +294,7 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
         if integ_col:
             df_tmp = df_tmp.rename(columns={integ_col: "integracion"})
         add_by_key(
-            df_tmp,
-            mapping={},  # already renamed
+            df_tmp, mapping={},
             left_on_opts=[
                 (["Nombre", "Apellido(s)"], ["Nombre", "Apellido(s)"]),
                 ("Email", find_col(df_tmp, ["correo", "email"]) or "Email"),
@@ -312,7 +302,7 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
             ]
         )
 
-    # ---- RSU / Estress / Hab. comunicación
+    # RSU / Estress / Hab. comunicación
     for sub_df, out_col, default_old in [
         (df_rsu, "rsu", "Tarea: Producto final"),
         (df_estress, "estress", "Tarea:Producto final"),
@@ -321,7 +311,6 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
         if sub_df is None:
             continue
         src = sub_df.copy()
-        # choose a score column if present
         score_col = None
         for c in sub_df.columns:
             if strip_accents(c).startswith("tarea") or "promedio" in strip_accents(c):
@@ -335,8 +324,7 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
             src[out_col] = pd.NA
 
         add_by_key(
-            src,
-            mapping={},  # already renamed
+            src, mapping={},
             left_on_opts=[
                 ("Email", find_col(src, ["correo", "email"]) or "Email"),
                 ("DNI", "DNI"),
@@ -344,30 +332,28 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
             ]
         )
 
-    # ---- Teacher Email Roster filter/fill
+    # Teacher Email Roster filter/fill
     if roster_file is not None:
         roster = load_teacher_email_roster(roster_file)
         roster["Email"] = roster["Email"].apply(normalize_email)
-        roster = roster.dropna(subset=["Email"])
-        valid_emails = set(roster["Email"].tolist())
+        roster = roster.dropna(subset=["Email"]).drop_duplicates(subset=["Email"])
+        if len(roster) == 0:
+            # Nothing to filter; keep going but warn in UI later
+            pass
+        else:
+            valid_emails = set(roster["Email"].tolist())
+            all_data = all_data[all_data["Email"].isin(valid_emails)]
+            all_data = pd.merge(all_data, roster, on="Email", how="left", suffixes=("", "_roster"))
+            # Fill names from roster when missing
+            def blank(x):
+                return (pd.isna(x)) or (str(x).strip() == "")
+            if "Nombre" in all_data.columns and "Nombre_roster" in all_data.columns:
+                all_data["Nombre"] = np.where(all_data["Nombre"].apply(blank), all_data["Nombre_roster"], all_data["Nombre"])
+            if "Apellido(s)" in all_data.columns and "Apellido(s)_roster" in all_data.columns:
+                all_data["Apellido(s)"] = np.where(all_data["Apellido(s)"].apply(blank), all_data["Apellido(s)_roster"], all_data["Apellido(s)"])
+            all_data = all_data.drop(columns=[c for c in ["Nombre_roster", "Apellido(s)_roster"] if c in all_data.columns])
 
-        # Keep only emails we know from roster
-        all_data = all_data[all_data["Email"].isin(valid_emails)]
-
-        # Fill missing names from roster
-        all_data = pd.merge(all_data, roster, on="Email", how="left", suffixes=("", "_roster"))
-
-        def blank(x):
-            return (pd.isna(x)) or (str(x).strip() == "")
-
-        if "Nombre" in all_data.columns and "Nombre_roster" in all_data.columns:
-            all_data["Nombre"] = np.where(all_data["Nombre"].apply(blank), all_data["Nombre_roster"], all_data["Nombre"])
-        if "Apellido(s)" in all_data.columns and "Apellido(s)_roster" in all_data.columns:
-            all_data["Apellido(s)"] = np.where(all_data["Apellido(s)"].apply(blank), all_data["Apellido(s)_roster"], all_data["Apellido(s)"])
-        drop_cols = [c for c in ["Nombre_roster", "Apellido(s)_roster"] if c in all_data.columns]
-        all_data = all_data.drop(columns=drop_cols)
-
-    # ---- Numeric components
+    # Numeric components
     numeric_columns = [
         "induccion", "bus_biblioteca", "diseno_sesion",
         "Zoom_basico", "Zoom_Avanzado", "Grupos_Moodle", "Rubrica",
@@ -379,18 +365,15 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
             all_data[col] = 0
         all_data[col] = pd.to_numeric(all_data[col], errors="coerce").fillna(0)
 
-    # ---- Metrics
+    # Metrics
     all_data["Average"] = all_data[numeric_columns].mean(axis=1).round(2)
-
     def calculate_percentage(row):
         scores = row[numeric_columns].values
         available = int(np.sum(np.array(scores) > 0))
         return round(available / len(numeric_columns) * 100, 2) if len(numeric_columns) else 0.0
-
     all_data["Percentage"] = all_data.apply(calculate_percentage, axis=1)
     all_data["Marks_Out_Of_20"] = (all_data["Percentage"] / 5).round(2)
 
-    # ---- Filter years + keep any with some score
     if "Year" not in all_data.columns:
         all_data["Year"] = pd.NA
     filtered = all_data[all_data["Year"].isin([2024, 2025])].copy()
@@ -398,7 +381,7 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
     if filtered.empty:
         return pd.DataFrame()
 
-    # ---- Dedup by Email (highest score, then avg, prefer 2025)
+    # Dedup by Email with tie-breaks
     filtered["YearPref"] = filtered["Year"].apply(lambda y: 1 if y == 2025 else 0)
     sorted_df = filtered.sort_values(
         by=["Marks_Out_Of_20", "Average", "YearPref"],
@@ -407,7 +390,6 @@ def extract_data_from_excel(master_file, roster_file=None, debug=False):
     highest = sorted_df.drop_duplicates(subset=["Email"], keep="first").copy()
     highest["Highest_Score_Year"] = highest["Year"]
 
-    # ---- Final columns
     final_columns = [
         "Periodo", "Highest_Score_Year", "Email", "DNI", "Nombre", "Apellido(s)",
         "induccion", "bus_biblioteca", "diseno_sesion",
@@ -429,8 +411,8 @@ def main():
 
     st.title("📊 UMA Scores — Highest Marks (2024 vs 2025)")
     st.markdown(
-        "Upload **Master** Excel and the **Teacher Email Roster** Excel (e.g., *C9_25-II_121025.xlsx*). "
-        "Teachers are identified by **Email**. We pick the row with the **highest _Marks Out Of 20_** across 2024 & 2025."
+        "Upload **Master** Excel and **Teacher Email Roster** (e.g., *C9_25-II_121025.xlsx*). "
+        "Teachers are identified by **Email**; we keep the row with the **highest Marks Out Of 20** across 2024 & 2025."
     )
 
     up_master = st.file_uploader("Choose the Master Excel file", type=["xlsx", "xls"], key="master")
@@ -477,25 +459,22 @@ def main():
 
         except Exception as e:
             st.error(f"Error while processing: {e}")
-            st.info(
-                "Tip: The app will skip any missing sheets. "
-                "If you still see this error, open your Render logs to see the full stack trace."
-            )
+            st.info("If you still see this error, check Render logs for the stack trace (likely a header mismatch).")
     else:
         st.info("👆 Please upload both the Master Excel and the Teacher Email Roster Excel to get started.")
         st.subheader("Expected Columns (quick reference)")
         st.markdown("""
-**Master Excel** (we detect sheets fuzzily; exact names not required):
-- **Inducción / nota Inducción**: `Periodo/ PERIODO`, `DNI`, `Nombre`, `Apellido(s)`, `Dirección de correo`, `Calificación` or `Total del curso (Real)`
+**Master Excel** (fuzzy sheet detection works):
+- **Inducción / nota Inducción**: `Periodo/PERIODO`, `DNI`, `Nombre`, `Apellido(s)`, `Dirección de correo`, `Calificación` or `Total del curso (Real)`
 - **Bus. biblioteca**: `DNI` and/or `Email`, `Promedio`
 - **Diseño de sesión**: `Nombre`, `Apellido(s)`, `Promedio`
-- **Comp. Tec**: Reto columns (Zoom básico/Avanzado, Grupos Moodle, Rúbrica, Padlet, Nearpod, Tareas y foros)
-- **Integración**: a column with the final score (title varies)
-- **RSU / estress / Hab. comunicación**: a score column (title varies). Email/DNI helpful.
+- **Comp. Tec**: Zoom básico/Avanzado, Grupos Moodle, Rúbrica, Padlet, Nearpod, Tareas y foros
+- **Integración**: final score column (title varies)
+- **RSU / estress / Hab. comunicación**: score column (title varies)
 
-**Teacher Email Roster** (e.g., C9_25-II_121025.xlsx):
+**Teacher Email Roster (e.g., C9_25-II_121025.xlsx)**:
 - One email column (e.g., `Dirección de correo`, `Correo`, `Email`).
-- Optional name columns (`Nombres`, `Apellido Paterno`, `Apellido Materno`) or a single full-name column.
+- Optional: names (`Nombres`, `Apellido Paterno`, `Apellido Materno`) or a single full-name column.
         """)
 
 if __name__ == "__main__":
