@@ -61,7 +61,7 @@ def load_teacher_contract(contract_file):
 
     out = pd.DataFrame({
         'DNI': df[dni_col].apply(normalize_dni_value),
-        'Nombre': df[name_col].astype(str).str.strip(),  # <-- fixed: use .str.strip()
+        'Nombre': df[name_col].astype(str).str.strip(),
         'Apellido(s)': (
             df[a_pat_col].astype(str).str.strip() + ' ' +
             df[a_mat_col].astype(str).str.strip()
@@ -173,22 +173,25 @@ def extract_data_from_excel(file_path, contract_file=None):
         on='DNI', how='left'
     )
 
-    # ---- Teacher Contract (optional but recommended)
+    # ---- Teacher Contract: FORCE include all contracted DNIs
     if contract_file is not None:
         contract = load_teacher_contract(contract_file)
         contract['DNI'] = contract['DNI'].apply(normalize_dni_value)
-        contract = contract.dropna(subset=['DNI'])
+        contract = contract.dropna(subset=['DNI']).drop_duplicates(subset=['DNI'])
 
-        # Keep only DNIs present in contract
-        all_data = all_data[all_data['DNI'].isin(contract['DNI'])]
-
-        # Fill names from contract when missing
+        # Right-join ensures every contracted teacher appears at least once
         all_data = pd.merge(
-            all_data, contract, on='DNI', how='left', suffixes=('', '_contract')
+            all_data, contract, on='DNI', how='right', suffixes=('', '_contract')
         )
+        # Prefer base names; if missing, take from contract
         all_data['Nombre'] = all_data['Nombre'].fillna(all_data['Nombre_contract'])
         all_data['Apellido(s)'] = all_data['Apellido(s)'].fillna(all_data['Apellido(s)_contract'])
         all_data = all_data.drop(columns=['Nombre_contract', 'Apellido(s)_contract'])
+
+        # Ensure Periodo/Year exist for contract-only rows
+        all_data['Periodo'] = all_data['Periodo'].fillna('2025')
+        # Make 'Year' numeric and default to 2025 if missing
+        all_data['Year'] = pd.to_numeric(all_data['Year'], errors='coerce').fillna(2025).astype(int)
 
     # ---- Numeric components (14 total)
     numeric_columns = [
@@ -198,7 +201,7 @@ def extract_data_from_excel(file_path, contract_file=None):
         'integracion', 'rsu', 'estress', 'hab_comunicacion'
     ]
     for col in numeric_columns:
-        all_data[col] = pd.to_numeric(all_data[col], errors='coerce').fillna(0)
+        all_data[col] = pd.to_numeric(all_data.get(col, 0), errors='coerce').fillna(0)
 
     # ---- Compute metrics
     all_data['Average'] = all_data[numeric_columns].mean(axis=1).round(2)
@@ -211,9 +214,8 @@ def extract_data_from_excel(file_path, contract_file=None):
     all_data['Percentage'] = all_data.apply(calculate_percentage, axis=1)
     all_data['Marks_Out_Of_20'] = (all_data['Percentage'] / 5).round(2)
 
-    # ---- Only compare 2024 vs 2025 and keep rows with any score
+    # ---- Only compare 2024 vs 2025 (INCLUDE zero-value rows + placeholders default to 2025)
     filtered = all_data[all_data['Year'].isin([2024, 2025])].copy()
-    filtered = filtered[filtered[numeric_columns].sum(axis=1) > 0]
 
     if filtered.empty:
         return pd.DataFrame()
@@ -237,6 +239,10 @@ def extract_data_from_excel(file_path, contract_file=None):
         'integracion', 'rsu', 'estress', 'hab_comunicacion',
         'Average', 'Marks_Out_Of_20', 'Percentage'
     ]
+    # Ensure presence even if some columns are missing
+    for c in final_columns:
+        if c not in highest.columns:
+            highest[c] = 0 if c in numeric_columns + ['Average', 'Marks_Out_Of_20', 'Percentage'] else ''
     final_df = highest[final_columns]
     return final_df
 
@@ -249,8 +255,11 @@ def main():
     st.title("📊 UMA Scores — Highest Marks (2024 vs 2025)")
     st.markdown(
         "Upload the **Master** Excel and the **Teacher Contract** Excel. "
-        "The output will contain **only one row per teacher (no duplicates)** — "
-        "the row corresponding to the **highest _Marks Out Of 20_ between 2024 and 2025**."
+        "The output contains **one row per teacher (no duplicates)** — "
+        "the row corresponding to the **highest _Marks Out Of 20_ between 2024 and 2025**. "
+        "**Teachers with all components = 0 are included.** "
+        "_If a contracted teacher is missing from the master entirely, they’re still shown "
+        "with `Periodo=2025`, `Year=2025`, and all scores = 0._"
     )
 
     # File uploaders
@@ -263,10 +272,10 @@ def main():
                 final_data = extract_data_from_excel(uploaded_file, contract_file=uploaded_contract)
 
             if len(final_data) == 0:
-                st.warning("No records with scores found for 2024 or 2025.")
+                st.warning("No records found for 2024 or 2025 (even zero-score rows and placeholders).")
                 return
 
-            st.success("Done! Showing only the highest marks per teacher (no duplicates).")
+            st.success("Done! Showing the highest marks per teacher (including zero-score and placeholder teachers).")
 
             # Preview
             st.subheader("Preview")
