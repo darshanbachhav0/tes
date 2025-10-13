@@ -4,39 +4,6 @@ import streamlit as st
 import io
 from datetime import datetime
 
-# ---------------------------
-# Helpers for contract logic
-# ---------------------------
-_CONTRACT_SUBSTRINGS = ("contrat", "docent", "teacher")  # matches: contrato, contratado, docente, teacher, etc.
-
-def _detect_contract_columns(df: pd.DataFrame):
-    cols = [c for c in df.columns if any(s in c.lower() for s in _CONTRACT_SUBSTRINGS)]
-    return cols
-
-def _contract_flag_series(df: pd.DataFrame) -> pd.Series:
-    """
-    Returns a boolean Series that is True if *any* teacher-contract column in the row
-    is truthy/non-empty/non-zero. If no contract-like columns exist, returns all False.
-    """
-    cols = _detect_contract_columns(df)
-    if not cols:
-        return pd.Series(False, index=df.index)
-
-    # Convert to strings where appropriate and check for non-empty / truthy values
-    sub = df[cols].copy()
-
-    # Normalize values: treat "", "0", "no", "false", NaN as False; anything else as True
-    def _to_bool(v):
-        if pd.isna(v):
-            return False
-        if isinstance(v, (int, float)):
-            return v != 0
-        s = str(v).strip().lower()
-        return s not in ("", "0", "no", "false", "nan", "none")
-
-    return sub.applymap(_to_bool).any(axis=1)
-
-
 def extract_data_from_excel(file_path):
     # Read all sheets
     induction_df = pd.read_excel(file_path, sheet_name='Inducción')
@@ -44,50 +11,33 @@ def extract_data_from_excel(file_path):
     bus_biblioteca_df = pd.read_excel(file_path, sheet_name='Bus. biblioteca')
     diseno_sesion_df = pd.read_excel(file_path, sheet_name='Diseño de sesión')
     comp_tec_df = pd.read_excel(file_path, sheet_name='Comp. Tec')
-
-    # ---------------------------
-    # Prepare induction sources
-    # ---------------------------
-    # nota_induccion
+    
+    # Create a master dataframe with all unique people from both induction sheets
+    # First, prepare the nota_induccion data
     nota_induccion_clean = nota_induccion_df[['PERIODO', 'DNI', 'Nombre', 'Apellido(s)', 'Dirección de correo', 'Total del curso (Real)']].copy()
     nota_induccion_clean = nota_induccion_clean.rename(columns={
-        'PERIODO': 'Periodo',
+        'PERIODO': 'Periodo', 
         'Total del curso (Real)': 'induccion'
     })
-    # Add contract flag from original nota_induccion_df
-    nota_induccion_clean['contract_flag'] = _contract_flag_series(nota_induccion_df)
-
-    # inducción
+    
+    # Prepare the induction data
     induction_clean = induction_df[['Periodo', 'DNI', 'Nombre', 'Apellido(s)', 'Dirección de correo', 'Calificación']].copy()
     induction_clean = induction_clean.rename(columns={'Calificación': 'induccion'})
-    # Add contract flag from original induction_df
-    induction_clean['contract_flag'] = _contract_flag_series(induction_df)
-
-    # Combine both induction-based datasets
-    all_data = pd.concat([nota_induccion_clean, induction_clean], ignore_index=True)
-
-    # ---------------------------
-    # Merge with other sheets
-    # ---------------------------
-    # Bus. biblioteca
+    
+    # Combine both datasets
+    all_data = pd.concat([nota_induccion_clean, induction_clean])
+    
+    # Merge with bus biblioteca data
     bus_biblioteca_df = bus_biblioteca_df.rename(columns={'Promedio': 'bus_biblioteca'})
-    all_data = pd.merge(
-        all_data,
-        bus_biblioteca_df[['DNI', 'bus_biblioteca']],
-        on='DNI',
-        how='left'
-    )
-
-    # Diseño de sesión (by name)
+    all_data = pd.merge(all_data, bus_biblioteca_df[['DNI', 'bus_biblioteca']], 
+                        on='DNI', how='left')
+    
+    # Merge with diseño de sesión data
     diseno_sesion_df = diseno_sesion_df.rename(columns={'Promedio': 'diseno_sesion'})
-    all_data = pd.merge(
-        all_data,
-        diseno_sesion_df[['Nombre', 'Apellido(s)', 'diseno_sesion']],
-        on=['Nombre', 'Apellido(s)'],
-        how='left'
-    )
-
-    # Comp. Tec (by name)
+    all_data = pd.merge(all_data, diseno_sesion_df[['Nombre', 'Apellido(s)', 'diseno_sesion']], 
+                        on=['Nombre', 'Apellido(s)'], how='left')
+    
+    # Merge with competencias técnicas data
     comp_tec_columns = {
         'Cuestionario:Reto: Zoom básico': 'Zoom_basico',
         'Cuestionario:Reto: Zoom Avanzado': 'Zoom_Avanzado',
@@ -97,123 +47,112 @@ def extract_data_from_excel(file_path):
         'Cuestionario:Reto: Nearpod': 'Nearpod',
         'Cuestionario:Reto: Tareas y foros': 'Tareas_y_foros'
     }
+    
     comp_tec_df = comp_tec_df.rename(columns=comp_tec_columns)
-    comp_keep = ['Nombre', 'Apellido(s)', 'Zoom_basico', 'Zoom_Avanzado',
-                 'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros']
-    comp_keep = [c for c in comp_keep if c in comp_tec_df.columns]
-    all_data = pd.merge(
-        all_data,
-        comp_tec_df[comp_keep],
-        on=['Nombre', 'Apellido(s)'],
-        how='left'
-    )
-
-    # ---------------------------
-    # Scoring
-    # ---------------------------
-    numeric_columns = [
-        'induccion', 'bus_biblioteca', 'diseno_sesion',
-        'Zoom_basico', 'Zoom_Avanzado', 'Grupos_Moodle',
-        'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros'
-    ]
-    # Ensure all expected numeric columns exist
-    for col in numeric_columns:
-        if col not in all_data.columns:
-            all_data[col] = 0
-
-    # Replace blanks with 0 and coerce to numeric
+    all_data = pd.merge(all_data, comp_tec_df[['Nombre', 'Apellido(s)', 'Zoom_basico', 'Zoom_Avanzado', 
+                                               'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros']], 
+                        on=['Nombre', 'Apellido(s)'], how='left')
+    
+    # Define numeric columns
+    numeric_columns = ['induccion', 'bus_biblioteca', 'diseno_sesion', 'Zoom_basico', 
+                      'Zoom_Avanzado', 'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros']
+    
+    # Replace empty strings and NaN with 0 for numeric columns
     for col in numeric_columns:
         all_data[col] = all_data[col].replace('', 0)
         all_data[col] = pd.to_numeric(all_data[col], errors='coerce').fillna(0)
-
-    # Average across 10 components (blanks already 0)
-    all_data['Average'] = all_data[numeric_columns].mean(axis=1).round(2)
-
-    # Percentage based on count of non-zero components
+    
+    # Calculate average of all 10 marks (treating blanks as 0)
+    all_data['Average'] = all_data[numeric_columns].mean(axis=1)
+    
+    # Format the average to 2 decimal places
+    all_data['Average'] = all_data['Average'].round(2)
+    
+    # Calculate percentage based on available components
     def calculate_percentage(row):
+        # Get the list of scores for the 10 components
         scores = row[numeric_columns].values
-        available_components = int((scores > 0).sum())
+        # Count how many components have non-zero scores
+        available_components = sum(score > 0 for score in scores)
+        
         if available_components == 0:
-            return 0.0
-        return round((available_components / 10) * 100, 2)
-
+            return 0
+        
+        # Calculate the percentage (available_components / 10 * 100)
+        percentage = (available_components / 10) * 100
+        return round(percentage, 2)
+    
+    # Calculate marks out of 20 based on percentage
+    def calculate_marks_out_of_20(row):
+        percentage = row['Percentage']
+        # Convert percentage to marks out of 20 (percentage / 5)
+        marks_out_of_20 = percentage / 5
+        return round(marks_out_of_20, 2)
+    
+    # Apply the percentage calculation to each row
     all_data['Percentage'] = all_data.apply(calculate_percentage, axis=1)
-
-    # Marks out of 20
-    all_data['Marks_Out_Of_20'] = (all_data['Percentage'] / 5).round(2)
-
-    # ---------------------------
-    # Identity + inclusion rule
-    # ---------------------------
-    all_data['Person_ID'] = (
-        all_data['DNI'].astype(str) + '_' +
-        all_data['Nombre'].astype(str) + '_' +
-        all_data['Apellido(s)'].astype(str)
-    )
-
-    # NEW: Include rows if (Average > 0) OR (contract_flag == True)
-    # (Previously we dropped Average==0 entirely.)
-    all_data = all_data[(all_data['Average'] > 0) | (all_data['contract_flag'])].copy()
-
-    # If still empty, return empty df
-    if all_data.empty:
+    
+    # Apply the marks out of 20 calculation to each row
+    all_data['Marks_Out_Of_20'] = all_data.apply(calculate_marks_out_of_20, axis=1)
+    
+    # Create a unique identifier for each person
+    all_data['Person_ID'] = all_data['DNI'].astype(str) + '_' + all_data['Nombre'] + '_' + all_data['Apellido(s)']
+    
+    # Filter out records where average is 0 (no scores available)
+    all_data = all_data[all_data['Average'] > 0]
+    
+    # If no records with scores, return empty dataframe
+    if len(all_data) == 0:
         return pd.DataFrame()
-
-    # Normalize/assist sorting by period (extract numeric if possible)
-    all_data['_Periodo_num'] = pd.to_numeric(all_data['Periodo'], errors='coerce').fillna(-1)
-
-    # Choose one row per Person_ID:
-    # 1) Highest Average
-    # 2) If tie, prefer rows with contract_flag == True
-    # 3) If still tie, prefer latest period (_Periodo_num largest)
-    all_data.sort_values(
-        by=['Person_ID', 'Average', 'contract_flag', '_Periodo_num'],
-        ascending=[True, False, False, False],
-        inplace=True
-    )
-    highest_scores = all_data.drop_duplicates(subset=['Person_ID'], keep='first').copy()
-
-    # Highest score period (keep original value)
+    
+    # Group by person and find the highest average score across periods
+    # Get the index of the row with the maximum average for each person
+    idx = all_data.groupby('Person_ID')['Average'].idxmax()
+    
+    # Select the rows with the highest scores
+    highest_scores = all_data.loc[idx].copy()
+    
+    # Add a column to indicate which period had the highest score
     highest_scores['Highest_Score_Period'] = highest_scores['Periodo']
-
-    # Final column order (unchanged)
+    
+    # Select and order the required columns for final output
     final_columns = [
         'Periodo', 'DNI', 'Nombre', 'Apellido(s)', 'induccion', 'bus_biblioteca', 'diseno_sesion',
         'Zoom_basico', 'Zoom_Avanzado', 'Grupos_Moodle', 'Rubrica', 'Padlet', 'Nearpod', 'Tareas_y_foros',
         'Average', 'Marks_Out_Of_20', 'Percentage', 'Highest_Score_Period'
     ]
-    final_columns = [c for c in final_columns if c in highest_scores.columns]
-    final_df = highest_scores[final_columns].copy()
-
+    
+    final_df = highest_scores[final_columns]
+    
     return final_df
-
 
 def main():
     st.set_page_config(page_title="Excel Data Processor", page_icon="📊", layout="wide")
-
+    
     st.title("📊 Excel Data Processor")
     st.markdown("Upload your Excel file to process and combine data from multiple sheets.")
-    st.info("This tool compares scores across periods and shows the row per professor with the highest average. "
-            "Professors marked in teacher-contract columns are included even if all marks are 0.")
-
+    st.info("This tool will compare scores from both 2024 and 2025 periods and show the highest score for each person.")
+    
+    # File uploader
     uploaded_file = st.file_uploader("Choose an Excel file", type=["xlsx", "xls"])
-
+    
     if uploaded_file is not None:
         try:
+            # Process the file
             with st.spinner("Processing your Excel file and comparing periods..."):
                 final_data = extract_data_from_excel(uploaded_file)
-
+            
             if len(final_data) == 0:
-                st.warning("No records found after processing.")
+                st.warning("No records with scores found in the uploaded file.")
                 return
-
+            
             st.success("File processed successfully!")
-
-            # Preview
-            st.subheader("Preview of Processed Data (One Row per Professor)")
+            
+            # Display preview
+            st.subheader("Preview of Processed Data (Showing Highest Scores)")
             st.dataframe(final_data.head())
-
-            # Metrics
+            
+            # Show some statistics
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Total Records", len(final_data))
@@ -223,63 +162,63 @@ def main():
                 st.metric("Avg Marks (Out of 20)", f"{final_data['Marks_Out_Of_20'].mean():.2f}")
             with col4:
                 st.metric("Avg Percentage", f"{final_data['Percentage'].mean():.2f}%")
-
-            # Safer count by year (handles string/numeric)
-            period_year = pd.to_numeric(final_data['Highest_Score_Period'], errors='coerce')
+            
             col5, col6, col7, col8 = st.columns(4)
             with col5:
-                st.metric("2024 Records", int((period_year == 2024).sum()))
+                st.metric("2024 Records", len(final_data[final_data['Highest_Score_Period'] == 2024]))
             with col6:
-                st.metric("2025 Records", int((period_year == 2025).sum()))
-
-            # Distribution by period label
+                st.metric("2025 Records", len(final_data[final_data['Highest_Score_Period'] == 2025]))
+            
+            # Show distribution of highest scores by period
             st.subheader("Highest Score Distribution by Period")
             period_counts = final_data['Highest_Score_Period'].value_counts()
             st.bar_chart(period_counts)
-
-            # Download
+            
+            # Create download button
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_filename = f"Final_Report_Highest_Scores_{timestamp}.xlsx"
-
+            
+            # Convert DataFrame to Excel bytes
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 final_data.to_excel(writer, index=False, sheet_name='Highest Scores')
-
+            
             output.seek(0)
+            
             st.download_button(
                 label="📥 Download Excel File with Highest Scores",
                 data=output,
                 file_name=output_filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                help="Contains one row per professor (highest average per person). "
-                     "Professors in teacher-contract columns are included even if marks are 0."
+                help="This file contains the highest scores for each person across both 2024 and 2025 periods"
             )
-
-            # Optional: sample listing
-            st.subheader("Sample of Included Professors")
-            st.info("Names shown here are exactly those in the exported file.")
-            st.dataframe(
-                final_data[['DNI', 'Nombre', 'Apellido(s)', 'Highest_Score_Period']].head(20)
-            )
-
+            
+            # Show some examples of people with scores from both periods
+            st.subheader("Sample of People with Scores from Both Periods")
+            st.info("The downloaded file shows only the highest score for each person. Below are some examples where people have scores from both periods.")
+            
         except Exception as e:
             st.error(f"An error occurred while processing the file: {str(e)}")
-            st.info("Please make sure your Excel file has the required sheets: "
-                    "'Inducción', 'nota Inducción', 'Bus. biblioteca', 'Diseño de sesión', and 'Comp. Tec'.")
-
+            st.info("Please make sure your Excel file has the required sheets: 'Inducción', 'nota Inducción', 'Bus. biblioteca', 'Diseño de sesión', and 'Comp. Tec'")
+    
     else:
         st.info("👆 Please upload an Excel file to get started.")
+        
+        # Show expected format
         st.subheader("Expected Excel File Format")
         st.markdown("""
         Your Excel file should contain the following sheets:
-        - **Inducción**: Basic professor information and grades
-        - **nota Inducción**: Detailed course grades
-        - **Bus. biblioteca**: Library search grades
-        - **Diseño de sesión**: Session design grades
-        - **Comp. Tec**: Technical competency grades
+        - **Inducción**: Contains basic student information and grades
+        - **nota Inducción**: Contains detailed course grades
+        - **Bus. biblioteca**: Contains library search grades
+        - **Diseño de sesión**: Contains session design grades
+        - **Comp. Tec**: Contains technical competency grades
         
-        The processor combines all these sheets, compares periods, and shows one row per professor.
-        Professors marked in any teacher-contract column are included even if marks are 0.
+        The processor will combine data from all these sheets, compare scores from 2024 and 2025 periods,
+        and show the highest score for each person.
         """)
+
 if __name__ == "__main__":
     main()
+
+
