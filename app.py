@@ -59,7 +59,6 @@ def _prep_names(df, name_col, ap_col=None, am_col=None):
         am = df[am_col].astype(str).str.strip()
         out['Apellido(s)'] = (ap + ' ' + am).str.replace(r'\s+', ' ', regex=True).str.strip()
     else:
-        # if we already have a single "Apellido(s)" column, keep it; otherwise blank
         ap_single = _first_col_like(df.columns, 'Apellido(s)')
         out['Apellido(s)'] = df[ap_single].astype(str).str.strip() if ap_single else pd.NA
     return out
@@ -80,7 +79,7 @@ def group_max(df, keys, num_cols):
     return g
 
 # -----------------------------
-# Load C9 roster (names & email)
+# Load C9 roster (names & email; email not exported)
 # -----------------------------
 def load_c9_roster(c9_file):
     """
@@ -126,7 +125,6 @@ def load_c9_roster(c9_file):
     out['DNI'] = out['DNI'].astype(str)
     out = out.dropna(subset=['DNI'])
     out = out[out['DNI'] != '']
-    # If the roster has duplicates (sections), keep the first non-null email/name
     out = out.sort_values(by=['Email'], na_position='last')
     out = out.drop_duplicates(subset=['DNI'], keep='first')
     return out[['DNI', 'Nombre', 'Apellido(s)', 'Email', 'Periodo']]
@@ -166,7 +164,7 @@ def extract_data_from_excel(file_path, c9_file=None):
     all_data['DNI'] = all_data['DNI'].apply(normalize_dni_value).astype(str)
     all_data['Year'] = all_data['Periodo'].apply(extract_year)
 
-    # If there were multiple rows per DNI/Periodo, keep the highest induccion grade
+    # If multiple rows per DNI/Periodo, keep highest induccion grade
     all_data['induccion'] = pd.to_numeric(all_data['induccion'], errors='coerce').fillna(0)
     all_data = all_data.groupby(
         ['DNI', 'Periodo', 'Year', 'Nombre', 'Apellido(s)'],
@@ -183,7 +181,6 @@ def extract_data_from_excel(file_path, c9_file=None):
     # ---------------- Diseño de sesión (join by names; pre-aggregate) ----------------
     diseno_sesion_df = diseno_sesion_df.rename(columns={'Promedio': 'diseno_sesion'})
     diseno_sesion_df['diseno_sesion'] = pd.to_numeric(diseno_sesion_df['diseno_sesion'], errors='coerce').fillna(0)
-    ds_cols = ['Nombre', 'Apellido(s)', 'diseno_sesion']
     diseno_sesion_g = group_max(diseno_sesion_df, ['Nombre', 'Apellido(s)'], ['diseno_sesion'])
     all_data = all_data.merge(diseno_sesion_g, on=['Nombre', 'Apellido(s)'], how='left')
 
@@ -211,49 +208,44 @@ def extract_data_from_excel(file_path, c9_file=None):
     integracion_g = group_max(integracion_df, ['Nombre','Apellido(s)'], ['integracion'])
     all_data = all_data.merge(integracion_g, on=['Nombre','Apellido(s)'], how='left')
 
-    # ---------------- RSU (by DNI) ----------------
+    # ---------------- RSU / estress / Hab. comunicación (by DNI) ----------------
     rsu_df['DNI'] = rsu_df['DNI'].apply(normalize_dni_value).astype(str)
     rsu_df = rsu_df.rename(columns={'Tarea: Producto final': 'rsu'})
     rsu_df['rsu'] = pd.to_numeric(rsu_df['rsu'], errors='coerce').fillna(0)
     rsu_g = group_max(rsu_df, ['DNI'], ['rsu'])
     all_data = all_data.merge(rsu_g, on='DNI', how='left')
 
-    # ---------------- estress (by DNI) ----------------
     estress_df['DNI'] = estress_df['DNI'].apply(normalize_dni_value).astype(str)
     estress_df = estress_df.rename(columns={'Tarea:Producto final': 'estress'})
     estress_df['estress'] = pd.to_numeric(estress_df['estress'], errors='coerce').fillna(0)
     estress_g = group_max(estress_df, ['DNI'], ['estress'])
     all_data = all_data.merge(estress_g, on='DNI', how='left')
 
-    # ---------------- Hab. comunicación (by DNI) ----------------
     hab_com_df['DNI'] = hab_com_df['DNI'].apply(normalize_dni_value).astype(str)
     hab_com_df = hab_com_df.rename(columns={'Tarea:Producto final': 'hab_comunicacion'})
     hab_com_df['hab_comunicacion'] = pd.to_numeric(hab_com_df['hab_comunicacion'], errors='coerce').fillna(0)
     hab_com_g = group_max(hab_com_df, ['DNI'], ['hab_comunicacion'])
     all_data = all_data.merge(hab_com_g, on='DNI', how='left')
 
-    # ---------------- Bring in C9 roster (names & email) ----------------
+    # ---------------- Bring in C9 roster (names & email; email not exported) ----------------
     if c9_file is not None:
         c9 = load_c9_roster(c9_file)
         c9['DNI'] = c9['DNI'].astype(str)
         c9['Year_roster'] = c9['Periodo'].apply(extract_year)
 
-        # Merge to enrich/override names + email from C9
+        # Merge to enrich/override names from C9
         all_data = all_data.merge(c9[['DNI','Nombre','Apellido(s)','Email','Periodo','Year_roster']],
                                   on='DNI', how='right', suffixes=('', '_c9'))
 
-        # Prefer C9 names/email when available
+        # Prefer C9 names when available
         all_data['Nombre'] = all_data['Nombre_c9'].fillna(all_data['Nombre'])
         all_data['Apellido(s)'] = all_data['Apellido(s)_c9'].fillna(all_data['Apellido(s)'])
-        all_data['Email'] = all_data['Email'].fillna(all_data.get('Dirección de correo'))
-        all_data['Email'] = all_data['Email'].replace('', np.nan)
-        all_data['Email'] = all_data['Email'].fillna(all_data.get('Dirección de correo'))
 
-        # If Periodo/Year was missing from induction sheets, use C9's
+        # If Periodo/Year missing from induction sheets, use C9's
         all_data['Periodo'] = all_data['Periodo'].fillna(all_data['Periodo_c9'])
         all_data['Year'] = all_data['Year'].fillna(all_data['Year_roster'])
 
-        # Clean temporary columns
+        # Clean tmp columns (also drop 'Dirección de correo' to avoid exporting email accidentally)
         drop_cols = [c for c in ['Nombre_c9','Apellido(s)_c9','Periodo_c9','Year_roster','Dirección de correo'] if c in all_data.columns]
         all_data = all_data.drop(columns=drop_cols)
 
@@ -282,30 +274,29 @@ def extract_data_from_excel(file_path, c9_file=None):
 
     # ---------------- Keep only 2024 vs 2025 rows; infer Year if still missing ----------------
     all_data['Year'] = all_data['Year'].fillna(all_data['Periodo'].apply(extract_year))
-    all_data['Year'] = all_data['Year'].fillna(2025)  # sensible default if nothing found
+    all_data['Year'] = all_data['Year'].fillna(2025)
     all_data = all_data[all_data['Year'].isin([2024, 2025])].copy()
-
     if all_data.empty:
         return pd.DataFrame()
 
     # ---------------- DEDUP: one row per DNI with the HIGHEST Marks (2024 vs 2025) ----------------
-    # Tie-breaker: higher Average, then prefer 2025
     all_data['YearPref'] = all_data['Year'].apply(lambda y: 1 if y == 2025 else 0)
-    sort_cols = ['Marks_Out_Of_20', 'Average', 'YearPref']
-    sorted_df = all_data.sort_values(by=sort_cols, ascending=[False, False, False])
+    sorted_df = all_data.sort_values(
+        by=['Marks_Out_Of_20', 'Average', 'YearPref'],
+        ascending=[False, False, False]
+    )
     highest = sorted_df.drop_duplicates(subset=['DNI'], keep='first').copy()
     highest['Highest_Score_Year'] = highest['Year']
 
-    # Final column order (+ Email)
+    # Final column order (NO Email)
     final_columns = [
-        'Periodo', 'Highest_Score_Year', 'DNI', 'Nombre', 'Apellido(s)', 'Email',
+        'Periodo', 'Highest_Score_Year', 'DNI', 'Nombre', 'Apellido(s)',
         'induccion', 'bus_biblioteca', 'diseno_sesion',
         'Zoom_basico', 'Zoom_Avanzado', 'Grupos_Moodle', 'Rubrica',
         'Padlet', 'Nearpod', 'Tareas_y_foros',
         'integracion', 'rsu', 'estress', 'hab_comunicacion',
         'Average', 'Marks_Out_Of_20', 'Percentage'
     ]
-    # Ensure all requested columns exist
     for c in final_columns:
         if c not in highest.columns:
             highest[c] = pd.NA
@@ -323,11 +314,11 @@ def main():
         "Upload the **Master** Excel and the **C9 roster** Excel. "
         "The output will contain **one row per teacher (unique by DNI)** — "
         "the row with the **highest _Marks Out Of 20_ across 2024 vs 2025**. "
-        "Teachers with **zero in all modules** are included as well."
+        "Teachers with **zero in all modules** are included."
     )
 
     uploaded_file = st.file_uploader("Choose the Master Excel file", type=["xlsx", "xls"], key="master")
-    uploaded_c9 = st.file_uploader("Choose the C9 roster Excel file (names & email)", type=["xlsx", "xls"], key="c9")
+    uploaded_c9 = st.file_uploader("Choose the C9 roster Excel file (names source)", type=["xlsx", "xls"], key="c9")
 
     if uploaded_file is not None and uploaded_c9 is not None:
         try:
@@ -357,7 +348,7 @@ def main():
             year_counts = final_data['Highest_Score_Year'].value_counts().sort_index()
             st.bar_chart(year_counts)
 
-            # Download (includes Email column)
+            # Download (NO Email column)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_filename = f"Highest_Marks_2024_vs_2025_{timestamp}.xlsx"
             output = io.BytesIO()
@@ -378,7 +369,7 @@ def main():
                 "Ensure your Master file contains these sheets: "
                 "'Inducción', 'nota Inducción', 'Bus. biblioteca', 'Diseño de sesión', 'Comp. Tec', "
                 "'Integración', 'RSU', 'estress', 'Hab. comunicación'. "
-                "C9 roster should include at least **DNI** and preferably **Email**, plus names."
+                "C9 roster should include at least **DNI** and names; Periodo helps set Year when missing."
             )
     else:
         st.info("👆 Please upload both the Master Excel and the C9 roster Excel to get started.")
@@ -396,9 +387,8 @@ def main():
         - **estress**: `Tarea:Producto final`
         - **Hab. comunicación**: `Tarea:Producto final`
 
-        **C9 roster (names & email)**:
-        - Must include `DNI`. Ideally also `NOMBRES`, `APELLIDO PATERNO`, `APELLIDO MATERNO`, and an email column like `Dirección de correo` / `Correo` / `Email`.
-        - If it has a `Periodo` column, we'll use it to set the **Year** when induction sheets don't provide it.
+        **C9 roster (names)**:
+        - Must include `DNI`. Ideally also `NOMBRES`, `APELLIDO PATERNO`, `APELLIDO MATERNO`. `Periodo` helps set Year.
         """)
 
 if __name__ == "__main__":
